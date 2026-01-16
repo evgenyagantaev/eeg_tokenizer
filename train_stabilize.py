@@ -5,6 +5,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import TensorDataset, DataLoader, random_split
 from vq_vae import EEG_VQ_VAE 
+import sys
+import datetime
+
+class Logger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding='utf-8')
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
 
 DATA_FILE = "eeg_dataset_4ch_shared.pt"
 WEIGHTS_FILE = "vq_vae_4ch.weights" # Грузим текущие
@@ -17,6 +32,10 @@ LEARNING_RATE = 5e-5    # <--- ОЧЕНЬ МАЛЕНЬКИЙ (в 6 раз мен
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def main():
+    log_filename = f"train_stabilize_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    sys.stdout = Logger(log_filename)
+    sys.stderr = sys.stdout # Catch errors too
+
     print(f"Running on: {DEVICE}")
     data_tensor = torch.load(DATA_FILE)
     

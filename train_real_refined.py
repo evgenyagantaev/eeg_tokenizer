@@ -5,6 +5,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import TensorDataset, DataLoader, random_split
 from vq_vae import VectorQuantizer # Импортируем только квантователь
+import sys
+import datetime
+
+class Logger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding='utf-8')
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
 
 # --- УЛУЧШЕННАЯ МОДЕЛЬ ---
 class Deeper_EEG_VQ_VAE(nn.Module):
@@ -52,6 +67,10 @@ NUM_EMBEDDINGS = 4096   # Увеличили словарь в 4 раза
 EMBEDDING_DIM = 64      
 
 def main():
+    log_filename = f"train_real_refined_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    sys.stdout = Logger(log_filename)
+    sys.stderr = sys.stdout # Catch errors too
+
     print(f"Running on: {DEVICE}")
     print(f"Config: Dict Size={NUM_EMBEDDINGS}, Epochs={EPOCHS}")
     

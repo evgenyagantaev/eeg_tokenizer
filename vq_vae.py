@@ -3,88 +3,96 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class VectorQuantizer(nn.Module):
-    # Добавили аргумент use_revival
-    def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.02, use_revival=True):
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25):
         super(VectorQuantizer, self).__init__()
         self._num_embeddings = num_embeddings
         self._embedding_dim = embedding_dim
         self._commitment_cost = commitment_cost
-        self.use_revival = use_revival # Запоминаем флаг
         
         self._embedding = nn.Embedding(self._num_embeddings, self._embedding_dim)
         self._embedding.weight.data.uniform_(-1/self._num_embeddings, 1/self._num_embeddings)
+        
+        # --- NEW: Буферы для умной реанимации ---
+        self.register_buffer('_usage_counter', torch.zeros(num_embeddings))
+        self.dead_threshold = 3000
+        self.max_resurrect_per_batch = 10
 
     def forward(self, inputs):
-        # inputs: [Batch, Channel, Length] -> [Batch, Length, Channel]
+        # inputs: [Batch, Length, Channel] (после permute)
         inputs = inputs.permute(0, 2, 1).contiguous()
         input_shape = inputs.shape
         
-        # Flatten input
         flat_input = inputs.view(-1, self._embedding_dim)
         
-        # L2 Norm
+        # L2 Normalization (Косинусное расстояние)
         flat_input_norm = F.normalize(flat_input, p=2, dim=1)
         embedding_weight_norm = F.normalize(self._embedding.weight, p=2, dim=1)
         
-        # Distances
         distances = (2 - 2 * torch.matmul(flat_input_norm, embedding_weight_norm.t()))
-            
-        # Indices
+        
         encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
         
-        # --- AGGRESSIVE DEAD CODE REVIVAL ---
-        # Теперь проверяем флаг
-        if self.training and self.use_revival:
-            # Считаем использование каждого токена в батче
-            # (bincount работает быстро на плоских индексах)
+        # --- IMPROVED DEAD CODE REVIVAL ---
+        n_resurrected = 0
+        if self.training:
+            # Считаем использование в текущем батче
             counts = torch.bincount(encoding_indices.flatten(), minlength=self._num_embeddings)
             
-            # Находим "ленивые" токены (использовались менее 2 раз в батче)
-            # При батче 4096 это значит, что токен почти мертв
-            dead_indices = torch.nonzero(counts < 2, as_tuple=False).flatten()
+            # Обновляем счетчик игнора: +1 всем, сброс тем, кто использовался
+            self._usage_counter += 1
+            self._usage_counter[counts > 0] = 0
+            
+            # Ищем тех, кто "залежался"
+            dead_indices = torch.nonzero(self._usage_counter > self.dead_threshold, as_tuple=False).flatten()
             
             if len(dead_indices) > 0:
-                # Выбираем случайные входы, чтобы перезаписать мертвецов
-                rand_inputs_idx = torch.randint(0, flat_input_norm.size(0), (len(dead_indices),), device=inputs.device)
-                new_weights = flat_input_norm[rand_inputs_idx].detach()
+                # Ограничиваем количество за один батч
+                num_to_revive = min(len(dead_indices), flat_input_norm.size(0), self.max_resurrect_per_batch)
+                
+                # Находим "обиженные" входные векторы (максимальное расстояние до ближайшего кода)
+                min_dist, _ = distances.min(dim=1)
+                _, top_k_idx = torch.topk(min_dist, k=num_to_revive)
+                
+                # Реанимируем
+                actual_dead_idx = dead_indices[:num_to_revive]
+                new_weights = flat_input_norm[top_k_idx].detach()
                 
                 with torch.no_grad():
-                    # Добавляем немного шума, чтобы они не слиплись
-                    self._embedding.weight.data[dead_indices] = new_weights + torch.randn_like(new_weights) * 0.01
+                    self._embedding.weight.data[actual_dead_idx] = new_weights + torch.randn_like(new_weights) * 0.001
+                    self._usage_counter[actual_dead_idx] = 0
+                
+                n_resurrected = num_to_revive
 
-        # Quantize (используем обновленный словарь)
-        # ВАЖНО: пересчитываем индексы для векторов, которые мы только что воскресили?
-        # Нет, это дорого. В этом шаге используем старые индексы, 
-        # а в следующей итерации "воскрешенные" векторы начнут притягивать к себе данные.
+        # Квантование (Используем нормализованные веса для консистентности)
+        quantized = F.embedding(encoding_indices, embedding_weight_norm).view(input_shape)
         
-        quantized = self._embedding(encoding_indices).view(input_shape)
-        
-        # Loss
-        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
-        q_latent_loss = F.mse_loss(quantized, inputs.detach())
+        # Loss (теперь всё в едином масштабе [-1, 1])
+        e_latent_loss = F.mse_loss(quantized.detach(), flat_input_norm.view(input_shape))
+        q_latent_loss = F.mse_loss(quantized, flat_input_norm.view(input_shape).detach())
         loss = q_latent_loss + self._commitment_cost * e_latent_loss
         
-        quantized = inputs + (quantized - inputs).detach()
+        # STE (Пробрасываем градиент к нормализованному входу)
+        quantized = flat_input_norm.view(input_shape) + (quantized - flat_input_norm.view(input_shape)).detach()
         quantized = quantized.permute(0, 2, 1).contiguous()
         
-        return loss, quantized, encoding_indices
+        return loss, quantized, encoding_indices, n_resurrected
 
 class EEG_VQ_VAE(nn.Module):
-    def __init__(self, input_dim=128, hidden_dim=512, embedding_dim=64, num_embeddings=4096, use_revival=True):
+    def __init__(self, input_dim=128, hidden_dim=256, embedding_dim=64, num_embeddings=4096):
         super(EEG_VQ_VAE, self).__init__()
         
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim), # Широкий слой
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim // 2), # 256
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, embedding_dim), # 64
         )
         
-        self._vq_vae = VectorQuantizer(num_embeddings, embedding_dim, use_revival=use_revival)
+        self._vq_vae = VectorQuantizer(num_embeddings, embedding_dim)
         
         self.decoder = nn.Sequential(
             nn.Linear(embedding_dim, hidden_dim // 2),
@@ -98,33 +106,58 @@ class EEG_VQ_VAE(nn.Module):
 
     def forward(self, x):
         z = self.encoder(x)
+        # Важно: нормализуем выход энкодера перед VQ
+        z = F.normalize(z, p=2, dim=1)
+        
         z = z.unsqueeze(2)
-        vq_loss, quantized, indices = self._vq_vae(z) 
+        vq_loss, quantized, indices, n_resurrected = self._vq_vae(z) 
         quantized = quantized.squeeze(2)
         x_recon = self.decoder(quantized)
         
-        # Perplexity
-        encodings = torch.zeros(indices.shape[0], self._vq_vae._num_embeddings, device=x.device)
-        encodings.scatter_(1, indices, 1)
-        avg_probs = torch.mean(encodings, dim=0)
-        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
-        
-        return vq_loss, x_recon, perplexity
+        return vq_loss, x_recon, float(n_resurrected)
 
     def init_codebook_from_data(self, data_loader, device):
-        print("Инициализация словаря...")
+        print("Инициализация словаря (K-Means)...")
+        self.eval()
         all_data = []
         for i, batch in enumerate(data_loader):
-            if i > 20: break
+            if i > 40: break # Собираем больше данных для качественной кластеризации
             all_data.append(batch[0].to(device))
         
         data = torch.cat(all_data, dim=0)
         with torch.no_grad():
             z = self.encoder(data)
             z = F.normalize(z, p=2, dim=1)
-            n_emb = self._vq_vae._num_embeddings
             
-            # K-Means++ style init (просто random sampling)
+            n_emb = self._vq_vae._num_embeddings
+            # Случайный выбор начальных центроидов из данных
             indices = torch.randperm(z.shape[0])[:n_emb]
-            self._vq_vae._embedding.weight.data.copy_(z[indices])
-            print(f"Словарь инициализирован {len(indices)} векторами.")
+            centroids = z[indices].clone()
+            
+            # 10 итераций мини-K-Means
+            for i in range(10):
+                # Находим ближайшие центроиды (через скалярное произведение)
+                dot_product = torch.matmul(z, centroids.t())
+                labels = torch.argmax(dot_product, dim=1)
+                
+                # Обновляем центроиды
+                new_centroids = torch.zeros_like(centroids)
+                counts = torch.zeros(n_emb, device=device)
+                
+                new_centroids.index_add_(0, labels, z)
+                counts.index_add_(0, labels, torch.ones(z.shape[0], device=device))
+                
+                # Обработка пустых кластеров
+                mask = counts > 0
+                new_centroids[mask] /= counts[mask].unsqueeze(1)
+                
+                if (counts == 0).any():
+                    num_empty = (counts == 0).sum().item()
+                    new_indices = torch.randperm(z.shape[0])[:num_empty]
+                    new_centroids[~mask] = z[new_indices]
+                
+                centroids = F.normalize(new_centroids, p=2, dim=1)
+                print(f"  K-Means итерация {i+1}/10 завершена")
+
+            self._vq_vae._embedding.weight.data.copy_(centroids)
+            print(f"Словарь инициализирован {n_emb} центроидами K-Means.")

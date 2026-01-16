@@ -4,6 +4,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import TensorDataset, DataLoader, random_split
 from vq_vae import EEG_VQ_VAE  # Импорт твоей модели
+import sys
+import datetime
+
+class Logger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding='utf-8')
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
 
 # --- НАСТРОЙКИ ---
 DATA_FILE = "eeg_dataset_fz.pt"
@@ -16,6 +31,10 @@ NUM_EMBEDDINGS = 1024   # Размер словаря (количество "с�
 EMBEDDING_DIM = 64      # Размер вектора токена
 
 def main():
+    log_filename = f"train_real_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    sys.stdout = Logger(log_filename)
+    sys.stderr = sys.stdout # Catch errors too
+
     print(f"Running on: {DEVICE}")
     
     # 1. Загрузка данных

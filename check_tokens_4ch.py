@@ -15,7 +15,7 @@ CH_INDICES = [0, 1, 3, 4]  # Fz, C3, C4, Pz
 
 # Параметры инференса (как для LLM)
 WINDOW_SIZE = 512
-STRIDE = 128            # Шаг 0.5 секунды
+STRIDE = 15            # Шаг
 TARGET_SPECTRUM_SIZE = 128
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -23,9 +23,9 @@ def load_model():
     # Модель была обучена на векторе 128
     model = EEG_VQ_VAE(
         input_dim=128, 
-        hidden_dim=512,
+        hidden_dim=256,
         embedding_dim=64, 
-        num_embeddings=4096
+        num_embeddings=2048
     ).to(DEVICE)
     
     # Загружаем веса
@@ -36,7 +36,9 @@ def load_model():
 
 def get_tokens_from_session(folder_path, model):
     file_path = os.path.join(folder_path, "game-raw-eeg-filtered.json")
-    if not os.path.exists(file_path): return []
+    if not os.path.exists(file_path): 
+        # print(f"File not found: {file_path}")
+        return []
     
     try:
         with open(file_path, 'r') as f:
@@ -108,12 +110,12 @@ def get_tokens_from_session(folder_path, model):
             
             # Используем хак для надежности (если класс старый)
             # Или лучше: используем forward VQ, если он возвращает индексы
-            _, _, indices = model._vq_vae(z)
+            _, _, indices, _ = model._vq_vae(z)
             
         return indices.view(-1).cpu().tolist()
 
     except Exception as e:
-        # print(f"Err: {e}")
+        print(f"Err in {folder_path}: {e}")
         return []
 
 def main():
@@ -136,7 +138,7 @@ def main():
     # --- СТАТИСТИКА ---
     total_tokens = len(all_tokens)
     unique_tokens = len(set(all_tokens))
-    vocab_size = 4096
+    vocab_size = model._vq_vae._num_embeddings
     
     print("=" * 40)
     print(f"Всего токенов: {total_tokens}")
